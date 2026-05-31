@@ -691,6 +691,22 @@ export class ConversationStore {
     return row?.count ?? 0;
   }
 
+  async countMessagesByIdentityHash(
+    conversationId: ConversationId,
+    role: MessageRole,
+    identityHash: string,
+  ): Promise<number> {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+       FROM messages
+       WHERE conversation_id = ? AND identity_hash = ? AND role = ?`,
+      )
+      .get(conversationId, identityHash, role) as unknown as CountRow | undefined;
+
+    return row?.count ?? 0;
+  }
+
   async countMessagesByIdentityBeforeTimestamp(params: {
     conversationId: ConversationId;
     role: MessageRole;
