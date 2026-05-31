@@ -864,6 +864,11 @@ describe("LCM integration: ingest -> assemble", () => {
     expect(summaryMsg).toBeDefined();
     expect(summaryMsg!.role).toBe("user");
     expect(summaryMsg!.content).toContain("This is a leaf summary");
+    // Injection persistence mitigation (issue #71): assembled summaries carry an
+    // untrusted taint label on the <summary> tag so downstream models treat them
+    // as historical reference, not current instructions. The semantics of the
+    // label are defined once in the runtime recall system prompt.
+    expect(summaryMsg!.content).toContain('trust="untrusted"');
   });
 
   it("emits depersonalized overflow diagnostics with top contributors", async () => {

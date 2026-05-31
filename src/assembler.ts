@@ -972,6 +972,10 @@ async function formatSummaryContent(
     `kind="${summary.kind}"`,
     `depth="${summary.depth}"`,
     `descendant_count="${summary.descendantCount}"`,
+    // Taint label (issue #71): marks summary content as untrusted historical
+    // context so downstream models don't treat injected directives within it as
+    // current instructions.
+    `trust="untrusted"`,
   ];
   if (summary.earliestAt) {
     attributes.push(`earliest_at="${formatDateForAttribute(summary.earliestAt, timezone)}"`);
@@ -981,7 +985,7 @@ async function formatSummaryContent(
   }
 
   const lines: string[] = [];
-  lines.push(`<summary ${attributes.join(" ")}>`); 
+  lines.push(`<summary ${attributes.join(" ")}>`);
 
   // For condensed summaries, include parent references.
   if (summary.kind === "condensed") {
@@ -1747,7 +1751,11 @@ export class ContextAssembler {
 
   /**
    * Resolve a context item that references a summary.
-   * Summaries are presented as user messages with a structured XML wrapper.
+   *
+   * Summaries are presented as user messages with a structured XML wrapper
+   * and explicit taint metadata marking them as historical context rather
+   * than current instructions.  This mitigates prompt-injection persistence
+   * across compaction boundaries.
    */
   private async resolveSummaryItem(item: ContextItemRecord): Promise<ResolvedItem | null> {
     const summary = await this.summaryStore.getSummary(item.summaryId!);
@@ -1762,7 +1770,16 @@ export class ContextAssembler {
         ? await this.summaryStore.getSummaryMessageSeqRange(summary.summaryId)
         : { maxSeq: null };
 
-    // Cast: summaries are synthetic user messages without full AgentMessage metadata
+    // Summaries are synthetic user messages — content carries a
+    // trust="untrusted" taint label on the <summary> tag to mitigate
+    // injection persistence (semantics defined in the recall system prompt).
+    //
+    // NOTE: the role stays "user" deliberately. A non-user role would be
+    // stronger (issue #71 rec. 1), but neither available runtime role is safe
+    // here: "toolResult" has no paired tool call and is dropped by
+    // sanitizeToolUseResultPairing, and "assistant" risks provider
+    // first-message/alternation constraints handled only by OpenClaw upstream.
+    // Downgrading the role requires upstream support; tracked in issue #71.
     return {
       ordinal: item.ordinal,
       message: { role: "user" as const, content } as AgentMessage,
