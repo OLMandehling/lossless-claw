@@ -5187,6 +5187,177 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(reconcileSpy).not.toHaveBeenCalled();
   });
 
+  it("falls back to full reconciliation when append-only suffix overlaps persisted history", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("append-only-overlap-fallback");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "seed user" },
+      { role: "assistant", content: "OK" },
+      { role: "user", content: "middle user" },
+      { role: "assistant", content: "OK" },
+    ]);
+    const firstTwoLineOffset = Buffer.byteLength(
+      readFileSync(sessionFile, "utf8").split("\n").slice(0, 2).join("\n") + "\n",
+      "utf8",
+    );
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-append-only-overlap-fallback";
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first).toEqual({ bootstrapped: true, importedMessages: 4 });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        message: { role: "user", content: [{ type: "text", text: "actual new tail" }] },
+      })}\n`,
+      "utf8",
+    );
+
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET last_processed_offset = ?,
+               last_seen_size = ?,
+               last_seen_mtime_ms = 0
+           WHERE conversation_id = ?`,
+        )
+        .run(firstTwoLineOffset, firstTwoLineOffset, conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "OK",
+      "middle user",
+      "OK",
+      "actual new tail",
+    ]);
+  });
+
+  it("blocks bounded no-anchor imports that are mostly already persisted history", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("no-anchor-duplicate-replay");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "old one" },
+      { role: "assistant", content: "old two" },
+      { role: "user", content: "old three" },
+      { role: "assistant", content: "old four" },
+    ]);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-no-anchor-duplicate-replay";
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first).toEqual({ bootstrapped: true, importedMessages: 4 });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const fileSize = statSync(sessionFile).size;
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET last_processed_offset = ?,
+               last_seen_size = ?,
+               last_seen_mtime_ms = 0
+           WHERE conversation_id = ?`,
+        )
+        .run(fileSize + 10_000, fileSize + 10_000, conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: false,
+      importedMessages: 0,
+      reason: "reconcile duplicate transcript replay",
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old one",
+      "old two",
+      "old three",
+      "old four",
+    ]);
+  });
+
+  it("imports the new tail when a same-path shrink keeps an already-persisted prefix", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-engine-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "lcm.db");
+    const sessionFile = createSessionFilePath("same-path-shrink-prefix-tail");
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "prefix one" },
+      { role: "assistant", content: "prefix two" },
+      { role: "user", content: "prefix three" },
+    ]);
+
+    const engine = createEngineAtDatabasePath(dbPath);
+    const sessionId = "bootstrap-same-path-shrink-prefix-tail";
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first).toEqual({ bootstrapped: true, importedMessages: 3 });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "prefix one" },
+      { role: "assistant", content: "prefix two" },
+      { role: "user", content: "prefix three" },
+      { role: "assistant", content: "actual same-path shrink tail" },
+    ]);
+
+    const rewrittenSize = statSync(sessionFile).size;
+    const rawDb = createLcmDatabaseConnection(dbPath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET last_processed_offset = ?,
+               last_seen_size = ?,
+               last_seen_mtime_ms = 0
+           WHERE conversation_id = ?`,
+        )
+        .run(rewrittenSize + 10_000, rewrittenSize + 10_000, conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "prefix one",
+      "prefix two",
+      "prefix three",
+      "actual same-path shrink tail",
+    ]);
+  });
+
   it("keeps the append-only fast path after heartbeat pruning changes the DB frontier", async () => {
     const sessionFile = createSessionFilePath("append-only-heartbeat-prune");
     const sm = SessionManager.open(sessionFile);

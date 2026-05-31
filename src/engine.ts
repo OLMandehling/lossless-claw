@@ -66,6 +66,7 @@ import {
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
+import { buildMessageIdentityHash } from "./store/message-identity.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
@@ -2939,7 +2940,7 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
 
 type TranscriptReconcileResult = {
   blockedByImportCap: boolean;
-  blockedReason?: "import-cap" | "cross-conversation-raw-id";
+  blockedReason?: "import-cap" | "cross-conversation-raw-id" | "duplicate-transcript-replay";
   importedMessages: number;
   hasOverlap: boolean;
 };
@@ -5237,6 +5238,70 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── ContextEngine interface ─────────────────────────────────────────────
 
+  private async analyzePersistedTranscriptIdentityOverlaps(params: {
+    conversationId: number;
+    messages: AgentMessage[];
+  }): Promise<{ overlaps: number; firstNonOverlappingIndex: number }> {
+    const existingCounts = new Map<string, number>();
+    const seenCounts = new Map<string, number>();
+    let overlaps = 0;
+    let firstNonOverlappingIndex = -1;
+
+    for (const [index, message] of params.messages.entries()) {
+      const stored = toStoredMessage(message);
+      const identityHash = buildMessageIdentityHash(stored.role, stored.content);
+      const key = `${stored.role}\u0000${identityHash}`;
+      const seen = (seenCounts.get(key) ?? 0) + 1;
+      seenCounts.set(key, seen);
+
+      let existing = existingCounts.get(key);
+      if (existing === undefined) {
+        existing = await this.conversationStore.countMessagesByIdentityHash(
+          params.conversationId,
+          stored.role,
+          identityHash,
+        );
+        existingCounts.set(key, existing);
+      }
+
+      if (seen <= existing) {
+        overlaps += 1;
+      } else if (firstNonOverlappingIndex < 0) {
+        firstNonOverlappingIndex = index;
+      }
+    }
+
+    return { overlaps, firstNonOverlappingIndex };
+  }
+
+  private async countPersistedTranscriptIdentityOverlaps(params: {
+    conversationId: number;
+    messages: AgentMessage[];
+  }): Promise<number> {
+    const analysis = await this.analyzePersistedTranscriptIdentityOverlaps(params);
+    return analysis.overlaps;
+  }
+
+  private async appendOnlyMessagesOverlapPersistedTranscript(params: {
+    conversationId: number;
+    messages: AgentMessage[];
+    sessionContext: string;
+    source: string;
+  }): Promise<boolean> {
+    const overlaps = await this.countPersistedTranscriptIdentityOverlaps({
+      conversationId: params.conversationId,
+      messages: params.messages,
+    });
+    if (overlaps === 0) {
+      return false;
+    }
+
+    this.deps.log.warn(
+      `[lcm] transcript import guard: ${params.source} found ${overlaps}/${params.messages.length} already-persisted message identities for ${params.sessionContext}; falling back to full reconciliation`,
+    );
+    return true;
+  }
+
   /**
    * Reconcile session-file history with persisted messages and append only the
    * tail that is present in JSONL but missing from LCM.
@@ -5366,13 +5431,44 @@ export class LcmContextEngine implements ContextEngine {
 
       if (anchorIndex < 0) {
         if (params.allowNoAnchorImport) {
+          const replayAnalysis = await this.analyzePersistedTranscriptIdentityOverlaps({
+            conversationId,
+            messages: historicalMessages,
+          });
+          const persistedIdentityOverlaps = replayAnalysis.overlaps;
+          let noAnchorImportMessages = historicalMessages;
+          const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
+          if (persistedIdentityOverlaps >= replayThreshold) {
+            if (replayAnalysis.firstNonOverlappingIndex < 0) {
+              this.deps.log.warn(
+                `[lcm] reconcileSessionTail: duplicate transcript replay blocked for ${sessionContext} - ${persistedIdentityOverlaps}/${historicalMessages.length} candidate messages already exist (reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent replay flood.`,
+              );
+              this.deps.log.debug(
+                `[lcm] reconcileSessionTail: blocked duplicate transcript replay for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} persistedIdentityOverlaps=${persistedIdentityOverlaps} overlap=false`,
+              );
+              return {
+                blockedByImportCap: true,
+                blockedReason: "duplicate-transcript-replay",
+                importedMessages: 0,
+                hasOverlap: false,
+              };
+            }
+
+            if (replayAnalysis.firstNonOverlappingIndex > 0) {
+              noAnchorImportMessages = historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex);
+              this.deps.log.warn(
+                `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
+              );
+            }
+          }
+
           const importCap = Math.max(Math.floor(existingDbCount * 0.2), 50);
-          if (historicalMessages.length > importCap) {
+          if (noAnchorImportMessages.length > importCap) {
             this.deps.log.warn(
-              `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${historicalMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
+              `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${noAnchorImportMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
             );
             this.deps.log.debug(
-              `[lcm] reconcileSessionTail: blocked no-anchor import for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} existingDbCount=${existingDbCount} cap=${importCap} overlap=false`,
+              `[lcm] reconcileSessionTail: blocked no-anchor import for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} existingDbCount=${existingDbCount} cap=${importCap} overlap=false`,
             );
             return {
               blockedByImportCap: true,
@@ -5386,7 +5482,7 @@ export class LcmContextEngine implements ContextEngine {
             const rawIdMatches = this.countActiveCrossConversationRawIdMatches({
               conversationId,
               sessionId,
-              messages: historicalMessages,
+              messages: noAnchorImportMessages,
             });
             if (rawIdMatches.matchedRawIds > 0) {
               this.deps.log.warn(
@@ -5405,7 +5501,7 @@ export class LcmContextEngine implements ContextEngine {
           }
 
           let importedMessages = 0;
-          for (const message of historicalMessages) {
+          for (const message of noAnchorImportMessages) {
             const result = await this.ingestSingle({
               sessionId,
               sessionKey: params.sessionKey,
@@ -5417,7 +5513,7 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
           this.deps.log.warn(
-            `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=${importedMessages} overlap=false`,
+            `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} overlap=false`,
           );
           return { blockedByImportCap: false, importedMessages, hasOverlap: false };
         }
@@ -5787,42 +5883,51 @@ export class LcmContextEngine implements ContextEngine {
               return reconcile;
             }
 
+            const appendOnlySessionContext = this.formatSessionLogContext({
+              conversationId: conversation.conversationId,
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+            });
             const replayFiltered = await this.filterBootstrapReplayMessages({
               messages: appended.messages,
-              sessionContext: this.formatSessionLogContext({
-                conversationId: conversation.conversationId,
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-              }),
+              sessionContext: appendOnlySessionContext,
               source: "afterTurn transcript reconcile append-only",
               sessionFile: params.sessionFile,
             });
             const replayFilteredMessages = replayFiltered.messages;
-            let importedMessages = 0;
-            for (const [index, message] of replayFilteredMessages.entries()) {
-              const result = await this.ingestSingle({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                message,
-                skipReplayTimestampFloodGuard:
-                  index < replayFiltered.replayGuardExemptPrefixLength,
-              });
-              if (result.ingested) {
-                importedMessages += 1;
+            const appendOnlyOverlapsPersisted = await this.appendOnlyMessagesOverlapPersistedTranscript({
+              conversationId: conversation.conversationId,
+              messages: replayFilteredMessages,
+              sessionContext: appendOnlySessionContext,
+              source: "afterTurn transcript reconcile append-only",
+            });
+            if (!appendOnlyOverlapsPersisted) {
+              let importedMessages = 0;
+              for (const [index, message] of replayFilteredMessages.entries()) {
+                const result = await this.ingestSingle({
+                  sessionId: params.sessionId,
+                  sessionKey: params.sessionKey,
+                  message,
+                  skipReplayTimestampFloodGuard:
+                    index < replayFiltered.replayGuardExemptPrefixLength,
+                });
+                if (result.ingested) {
+                  importedMessages += 1;
+                }
               }
+              if (importedMessages > 0) {
+                this.recordRecentBootstrapImport(
+                  conversation.conversationId,
+                  importedMessages,
+                  "reconciled missing session messages",
+                );
+                await this.refreshBootstrapState({
+                  conversationId: conversation.conversationId,
+                  sessionFile: params.sessionFile,
+                });
+              }
+              return { importedMessages, blockedByImportCap: false, hasOverlap: true };
             }
-            if (importedMessages > 0) {
-              this.recordRecentBootstrapImport(
-                conversation.conversationId,
-                importedMessages,
-                "reconciled missing session messages",
-              );
-              await this.refreshBootstrapState({
-                conversationId: conversation.conversationId,
-                sessionFile: params.sessionFile,
-              });
-            }
-            return { importedMessages, blockedByImportCap: false, hasOverlap: true };
           }
         }
 
@@ -6323,50 +6428,58 @@ export class LcmContextEngine implements ContextEngine {
                   await this.conversationStore.markConversationBootstrapped(conversationId);
                 }
 
+                const appendOnlySessionContext = this.formatSessionLogContext({
+                  conversationId,
+                  sessionId: params.sessionId,
+                  sessionKey: params.sessionKey,
+                });
                 const replayFiltered = await this.filterBootstrapReplayMessages({
                   messages: appended.messages,
-                  sessionContext: this.formatSessionLogContext({
-                    conversationId,
-                    sessionId: params.sessionId,
-                    sessionKey: params.sessionKey,
-                  }),
+                  sessionContext: appendOnlySessionContext,
                   source: "bootstrap append-only",
                   sessionFile: params.sessionFile,
                 });
                 const replayFilteredMessages = replayFiltered.messages;
-
-                let importedMessages = 0;
-                for (const [index, message] of replayFilteredMessages.entries()) {
-                  const ingestResult = await this.ingestSingle({
-                    sessionId: params.sessionId,
-                    sessionKey: params.sessionKey,
-                    message,
-                    skipReplayTimestampFloodGuard:
-                      index < replayFiltered.replayGuardExemptPrefixLength,
-                  });
-                  if (ingestResult.ingested) {
-                    importedMessages += 1;
+                const appendOnlyOverlapsPersisted = await this.appendOnlyMessagesOverlapPersistedTranscript({
+                  conversationId,
+                  messages: replayFilteredMessages,
+                  sessionContext: appendOnlySessionContext,
+                  source: "bootstrap append-only",
+                });
+                if (!appendOnlyOverlapsPersisted) {
+                  let importedMessages = 0;
+                  for (const [index, message] of replayFilteredMessages.entries()) {
+                    const ingestResult = await this.ingestSingle({
+                      sessionId: params.sessionId,
+                      sessionKey: params.sessionKey,
+                      message,
+                      skipReplayTimestampFloodGuard:
+                        index < replayFiltered.replayGuardExemptPrefixLength,
+                    });
+                    if (ingestResult.ingested) {
+                      importedMessages += 1;
+                    }
                   }
-                }
 
-                await persistBootstrapState(conversationId);
-                this.deps.log.debug(
-                  `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} replayFilteredMessages=${replayFilteredMessages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
-                );
+                  await persistBootstrapState(conversationId);
+                  this.deps.log.debug(
+                    `[lcm] bootstrap: append-only conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} appendedMessages=${appended.messages.length} replayFilteredMessages=${replayFilteredMessages.length} importedMessages=${importedMessages} duration=${formatDurationMs(Date.now() - startedAt)}`,
+                  );
 
-                if (importedMessages > 0) {
+                  if (importedMessages > 0) {
+                    return {
+                      bootstrapped: true,
+                      importedMessages,
+                      reason: "reconciled missing session messages",
+                    };
+                  }
+
                   return {
-                    bootstrapped: true,
-                    importedMessages,
-                    reason: "reconciled missing session messages",
+                    bootstrapped: false,
+                    importedMessages: 0,
+                    reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
                   };
                 }
-
-                return {
-                  bootstrapped: false,
-                  importedMessages: 0,
-                  reason: conversation.bootstrappedAt ? "already bootstrapped" : "conversation already up to date",
-                };
               }
             }
           }
@@ -6485,6 +6598,8 @@ export class LcmContextEngine implements ContextEngine {
               reason:
                 reconcile.blockedReason === "cross-conversation-raw-id"
                   ? "reconcile duplicate raw ids"
+                  : reconcile.blockedReason === "duplicate-transcript-replay"
+                    ? "reconcile duplicate transcript replay"
                   : "reconcile import capped",
             };
           }
