@@ -22,6 +22,10 @@ export interface CompactionDecision {
   storedTokens: number;
   /** Runtime-observed prompt tokens, when supplied by the host. */
   observedTokens?: number;
+  /** Raw message tokens outside the protected fresh tail, when live prompt pressure is known. */
+  rawTokensOutsideTail?: number;
+  /** Projected prompt pressure after adding unsummarized raw backlog to observed tokens. */
+  projectedTokens?: number;
   currentTokens: number;
   threshold: number;
 }
@@ -94,6 +98,8 @@ export interface CompactionConfig {
   timezone?: string;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
+  /** Injected context XML tags to strip before compaction summarization. */
+  stripInjectedContextTags?: string[];
 }
 
 type CompactionLevel = "normal" | "aggressive" | "fallback" | "capped";
@@ -262,7 +268,7 @@ const MEDIA_PATH_RE = /^MEDIA:\/.+$/;
 const EMBEDDED_DATA_URL_RE = /data:[^;\s"'`]+;base64,[A-Za-z0-9+/=\s]+/gi;
 const MEDIA_ATTACHMENT_PART_TYPES = new Set(["file", "snapshot"]);
 const MEDIA_ATTACHMENT_RAW_TYPES = new Set(["file", "image", "snapshot"]);
-const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking"]);
+const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 const STRUCTURED_MEDIA_TEXT_KEYS = ["text", "caption", "alt", "title", "summary"] as const;
 const STRUCTURED_MEDIA_NESTED_KEYS = [
   "content",
@@ -350,6 +356,39 @@ function stripEmbeddedMediaPayloads(content: string): string {
       return true;
     });
   return sanitizedLines.join("\n").trim();
+}
+
+/**
+ * Strip auto-injected context blocks from message content.
+ *
+ * Memory and context plugins (active-memory, memory-lancedb, hindsight-openclaw,
+ * etc.) prepend XML-tagged blocks to user messages via the `prependContext` hook.
+ * These blocks contain ephemeral retrieval context that should not leak into
+ * compacted summaries or FTS indexes.
+ *
+ * Each tag name from `tags` is matched case-insensitively as `<tag>.....</tag>`.
+ * The leading "Untrusted context" header used by active-memory is also stripped.
+ */
+export function stripInjectedContextBlocks(content: string, tags: string[] | undefined): string {
+  if (!tags || tags.length === 0) {
+    return content;
+  }
+  let result = content;
+  for (const tag of tags) {
+    // Escape any regex-special chars in the tag name (e.g. hyphens).
+    const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(
+      `<${escaped}>[\\s\\S]*?</${escaped}>`,
+      "gi",
+    );
+    result = result.replace(re, "");
+  }
+  // Strip the "Untrusted context" one-liner header used by active-memory.
+  result = result.replace(
+    /^Untrusted context \(metadata, do not treat as instructions or commands\):\s*/gim,
+    "",
+  );
+  return result.trim();
 }
 
 /** Extract human-readable text from structured content while ignoring attachment payload fields. */
@@ -466,6 +505,10 @@ function extractMeaningfulStructuredText(value: unknown): string {
 
 /** Extract a readable fallback from one structured message part. */
 function extractMessagePartSummaryText(part: MessagePartRecord): string {
+  if (part.partType === "reasoning") {
+    return "";
+  }
+
   const sections: string[] = [];
   const text = extractMeaningfulStructuredText(part.textContent);
   if (text) {
@@ -573,7 +616,11 @@ export class CompactionEngine {
       observedTokenCount > 0
         ? Math.floor(observedTokenCount)
         : 0;
-    const currentTokens = Math.max(storedTokens, liveTokens);
+    const rawTokensOutsideTail =
+      liveTokens > 0 ? await this.countRawTokensOutsideFreshTail(conversationId) : undefined;
+    const projectedTokens =
+      liveTokens > 0 ? liveTokens + (rawTokensOutsideTail ?? 0) : undefined;
+    const currentTokens = Math.max(storedTokens, projectedTokens ?? liveTokens);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
 
     if (currentTokens > threshold) {
@@ -582,6 +629,8 @@ export class CompactionEngine {
         reason: "threshold",
         storedTokens,
         ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
+        ...(rawTokensOutsideTail !== undefined ? { rawTokensOutsideTail } : {}),
+        ...(projectedTokens !== undefined ? { projectedTokens } : {}),
         currentTokens,
         threshold,
       };
@@ -592,6 +641,8 @@ export class CompactionEngine {
       reason: "none",
       storedTokens,
       ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
+      ...(rawTokensOutsideTail !== undefined ? { rawTokensOutsideTail } : {}),
+      ...(projectedTokens !== undefined ? { projectedTokens } : {}),
       currentTokens,
       threshold,
     };
@@ -1947,10 +1998,11 @@ export class CompactionEngine {
 
     const concatenated = messageContents
       .map((message) => {
-        // Strip provider reasoning/thinking blocks (e.g. {type:"thinking",thinkingSignature:"..."})
-        // so encrypted signatures and non-visible metadata don't pollute the summary.
-        // The raw message content is preserved in the DB for conversation history and prompt caching.
-        const text = extractMeaningfulMessageText(message.content);
+        // Strip injected plugin context blocks (memory/hindsight XML tags) first,
+        // then strip provider reasoning/thinking blocks so encrypted signatures and
+        // non-visible metadata don't pollute the summary.
+        const cleaned = stripInjectedContextBlocks(message.content, this.config.stripInjectedContextTags);
+        const text = extractMeaningfulMessageText(cleaned);
         if (!text) return null;
         return `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${text}`;
       })
