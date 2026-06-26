@@ -369,7 +369,12 @@ export class LcmContextEngine implements ContextEngine {
       this.summaryStore,
       (params) => this.resolveLargeFileTextSummarizer(params),
     );
-    this.batchDeduplicator = new BatchDeduplicator(this.conversationStore, this.deps);
+    this.batchDeduplicator = new BatchDeduplicator(
+      this.conversationStore,
+      this.summaryStore,
+      this.config.largeFilesDir,
+      this.deps,
+    );
     this.sessionRolloverDetector = new SessionRolloverDetector(
       this.conversationStore,
       this.summaryStore,
@@ -2679,6 +2684,9 @@ export class LcmContextEngine implements ContextEngine {
           messageForParts = {
             ...message,
             content: stored.content,
+            fileBlocksExternalized: true,
+            externalizedFileIds: intercepted.fileIds,
+            externalizationReason: "large_file_block",
           } as AgentMessage;
         }
       }
@@ -2803,6 +2811,7 @@ export class LcmContextEngine implements ContextEngine {
               sessionKey: params.sessionKey,
               message,
               isHeartbeat: params.isHeartbeat,
+              createdAt: resolveTranscriptMessageCreatedAt(message),
             });
             if (result.ingested) {
               ingestedCount += 1;
@@ -2933,7 +2942,7 @@ export class LcmContextEngine implements ContextEngine {
         params.sessionKey,
         newMessages,
         {
-          oversizedNoOverlap: transcriptReconcileResult.importedMessages > 0 ? "ingest" : "skip",
+          oversizedNoOverlap: "ingest",
         },
       );
     }
