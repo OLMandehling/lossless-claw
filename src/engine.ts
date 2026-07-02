@@ -50,6 +50,7 @@ import {
   type ConversationRecord,
 } from "./store/conversation-store.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
+import { buildToolCallInputMap } from "./tool-pairing.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
 import type { LcmDependencies } from "./types.js";
@@ -3496,11 +3497,24 @@ export class LcmContextEngine implements ContextEngine {
         // Keep the rewritten view local; OpenClaw owns the live message array.
         const rewrittenMessages = liveMessages.slice();
         let interceptedAny = false;
+        const lastLiveUserIndex = (() => {
+          for (let index = liveMessages.length - 1; index >= 0; index--) {
+            if (liveMessages[index]?.role === "user") {
+              return index;
+            }
+          }
+          return -1;
+        })();
+        const currentTurnToolCallInputMap =
+          lastLiveUserIndex >= 0
+            ? buildToolCallInputMap(liveMessages.slice(lastLiveUserIndex + 1))
+            : undefined;
         for (let i = 0; i < liveMessages.length; i++) {
           const message = liveMessages[i]!;
           const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
             conversationId: conversation.conversationId,
             message,
+            toolCallInputMap: i > lastLiveUserIndex ? currentTurnToolCallInputMap : undefined,
             getFileId: ({ content, toolName, callId }) =>
               buildLiveToolOutputFileId({
                 conversationId: conversation.conversationId,
