@@ -44,7 +44,11 @@ import { compileSessionPatterns, matchesSessionPattern } from "./session-pattern
 import { logStartupBannerOnce } from "./startup-banner-log.js";
 import { CompactionTelemetryStore } from "./store/compaction-telemetry-store.js";
 import { CompactionMaintenanceStore } from "./store/compaction-maintenance-store.js";
-import { ConversationStore, type ConversationRecord } from "./store/conversation-store.js";
+import {
+  ConversationStore,
+  type ArchiveCause,
+  type ConversationRecord,
+} from "./store/conversation-store.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
@@ -94,6 +98,18 @@ const LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapab
 ];
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
+
+// Host-contract dependency: the deliberate-vs-incidental archive distinction
+// relies on OpenClaw emitting these exact reason strings only for genuine
+// operator actions. A real /reset surfaces BOTH a before_reset(reason=reset) and
+// a session_end(reason=reset), so both lifecycle handlers must map reset to
+// manual-reset; the COALESCE write makes the order between them irrelevant. If
+// the host renames a reason, the mapping changes silently; the producer mapping
+// test guards it.
+const HOST_BEFORE_RESET_REASON_NEW = "new";
+const HOST_BEFORE_RESET_REASON_RESET = "reset";
+const HOST_SESSION_END_REASON_DELETED = "deleted";
+const HOST_SESSION_END_REASON_RESET = "reset";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
 type CompactionExecutionParams = {
@@ -4176,6 +4192,7 @@ export class LcmContextEngine implements ContextEngine {
    */
   private async applySessionReplacement(params: {
     reason: string;
+    archiveCause: ArchiveCause;
     sessionId?: string;
     sessionKey?: string;
     nextSessionId?: string;
@@ -4198,7 +4215,7 @@ export class LcmContextEngine implements ContextEngine {
         );
         return;
       }
-      await this.conversationStore.archiveConversation(current.conversationId);
+      await this.conversationStore.archiveConversation(current.conversationId, params.archiveCause);
     }
 
     if (!params.createReplacement) {
@@ -4230,7 +4247,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
   }): Promise<void> {
     const reason = params.reason?.trim();
-    if (reason !== "new" && reason !== "reset") {
+    if (reason !== HOST_BEFORE_RESET_REASON_NEW && reason !== HOST_BEFORE_RESET_REASON_RESET) {
       return;
     }
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
@@ -4245,7 +4262,7 @@ export class LcmContextEngine implements ContextEngine {
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () =>
         this.conversationStore.withTransaction(async () => {
-          if (reason === "new") {
+          if (reason === HOST_BEFORE_RESET_REASON_NEW) {
             const conversation = await this.conversationStore.getConversationForSession({
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
@@ -4267,6 +4284,7 @@ export class LcmContextEngine implements ContextEngine {
           }
           await this.applySessionReplacement({
             reason: "/reset",
+            archiveCause: "manual-reset",
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
             createReplacement: true,
@@ -4301,7 +4319,7 @@ export class LcmContextEngine implements ContextEngine {
       return;
     }
 
-    const createReplacement = reason !== "deleted";
+    const createReplacement = reason !== HOST_SESSION_END_REASON_DELETED;
     this.ensureMigrated();
     await this.withSessionQueue(
       this.resolveSessionQueueKey(params.nextSessionId ?? params.sessionId, params.sessionKey ?? params.nextSessionKey),
@@ -4309,6 +4327,12 @@ export class LcmContextEngine implements ContextEngine {
         this.conversationStore.withTransaction(async () => {
           await this.applySessionReplacement({
             reason: `session_end:${reason}`,
+            archiveCause:
+              reason === HOST_SESSION_END_REASON_DELETED
+                ? "session-deleted"
+                : reason === HOST_SESSION_END_REASON_RESET
+                  ? "manual-reset"
+                  : "session-end",
             sessionId: params.sessionId,
             sessionKey: params.sessionKey ?? params.nextSessionKey,
             nextSessionId: params.nextSessionId,
