@@ -415,12 +415,12 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(messages.map((message) => message.content)).toEqual(["nice! thank you!"]);
   });
 
-  it("keeps a conv-info-only runtime copy without trusted timestamp evidence", async () => {
-    const sessionFile = createSessionFilePath("decorated-convinfo-dup");
+  it("keeps a single conv-info-only runtime copy without a sibling anchor", async () => {
+    const sessionFile = createSessionFilePath("decorated-convinfo-repeat");
     const header = JSON.stringify({
       type: "session",
       version: 3,
-      id: "decorated-convinfo-dup-header",
+      id: "decorated-convinfo-repeat-header",
       timestamp: new Date().toISOString(),
       cwd: process.cwd(),
     });
@@ -439,7 +439,7 @@ describe("afterTurn covered-frontier alignment", () => {
     );
 
     const engine = createEngine();
-    const sessionId = "decorated-convinfo-dup";
+    const sessionId = "decorated-convinfo-repeat";
     const decorated =
       'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000002"\n}\n```\n\nHey there! hows it going?';
     await engine.afterTurn({
@@ -456,6 +456,54 @@ describe("afterTurn covered-frontier alignment", () => {
     expect(messages.map((message) => message.content)).toEqual([
       "Hey there! hows it going?",
       decorated,
+    ]);
+  });
+
+  it("uses a sibling exact row to collapse a conv-info-only runtime copy onto its bare transcript row", async () => {
+    const sessionFile = createSessionFilePath("decorated-convinfo-anchored-dup");
+    const header = JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "decorated-convinfo-anchored-dup-header",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    });
+    const entryLine = (id: string, parentId: string | null, role: AgentMessage["role"], text: string) =>
+      JSON.stringify({
+        type: "message",
+        id,
+        parentId,
+        timestamp: new Date().toISOString(),
+        message: { role, content: [{ type: "text", text }] },
+      });
+    writeFileSync(
+      sessionFile,
+      [
+        header,
+        entryLine("ci-a-1", null, "user", "Hey there! hows it going?"),
+        entryLine("ci-a-2", "ci-a-1", "assistant", "all good"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const engine = createEngine();
+    const sessionId = "decorated-convinfo-anchored-dup";
+    const decorated =
+      'Conversation info (untrusted metadata):\n```json\n{\n  "chat_id": "telegram:100000002"\n}\n```\n\nHey there! hows it going?';
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage("user", decorated), makeMessage("assistant", "all good")],
+      prePromptMessageCount: 0,
+    });
+
+    const conversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId });
+    const messages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(messages.map((message) => message.content)).toEqual([
+      "Hey there! hows it going?",
+      "all good",
     ]);
   });
 

@@ -75,6 +75,27 @@ export function extractBodyAfterOpenClawInboundMetadataBlock(content: string): s
   return stripMetadataSeparator(remaining);
 }
 
+/**
+ * True when the runtime candidate begins with a recognized inbound-metadata
+ * block and reduces to the same non-empty body as the persisted bare candidate.
+ * Metadata and recap blocks are stripped only from the runtime side; the
+ * persisted side gets timestamp-normalized but keeps metadata-shaped text
+ * verbatim, because persisted content is user-authored unless another layer
+ * proves otherwise. This is byte-equality of the full reduced bodies, not
+ * containment, so an undecorated row, a distinct turn whose trailing line
+ * merely matches a prior body, or a forged metadata frame concealing a
+ * different body is never treated as the same turn (fail-closed).
+ */
+export function openClawInboundBodiesMatch(liveContent: string, bareContent: string): boolean {
+  const liveBodyAfterMetadata = extractBodyAfterOpenClawInboundMetadataBlock(liveContent);
+  if (liveBodyAfterMetadata === null) {
+    return false;
+  }
+  const liveBody = stripLeadingOpenClawInboundTimestamp(liveBodyAfterMetadata);
+  const bareBody = stripLeadingOpenClawInboundTimestamp(bareContent);
+  return liveBody.trim().length > 0 && liveBody === bareBody;
+}
+
 const CONVERSATION_INFO_KEYS = new Set([
   "chat_id",
   "message_id",

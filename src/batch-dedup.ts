@@ -23,6 +23,7 @@ import {
 } from "./message-content.js";
 import { messageIdentity } from "./message-signatures.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
+import { openClawInboundBodiesMatch } from "./openclaw-inbound-metadata.js";
 import type { ConversationStore, MessageRecord } from "./store/conversation-store.js";
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import type { LargeFileRecord, SummaryStore } from "./store/summary-store.js";
@@ -80,6 +81,7 @@ export class BatchDeduplicator {
     persistedContent: string,
     batchRole: string,
     batchContent: string,
+    options?: { allowUntimestampedInboundBodyMatch?: boolean },
   ): boolean {
     if (
       messageIdentity(persistedRole, persistedContent) ===
@@ -89,6 +91,16 @@ export class BatchDeduplicator {
     }
     if (persistedRole !== "user" || batchRole !== "user") {
       return false;
+    }
+    // A metadata block alone is user-forgeable, so body equality after stripping
+    // it is not proof of same-turn decoration. Covered-frontier callers may use
+    // this no-timestamp match only as alignment support; another exact or
+    // timestamp-backed row must still anchor the slice.
+    if (
+      options?.allowUntimestampedInboundBodyMatch === true &&
+      openClawInboundBodiesMatch(batchContent, persistedContent)
+    ) {
+      return true;
     }
     return liveContentIsRecognizedDecoratedBareBody({
       liveContent: batchContent,
@@ -152,6 +164,17 @@ export class BatchDeduplicator {
             )
           ) {
             exactAnchor = true;
+            continue;
+          }
+          if (
+            this.runtimeRowCoversPersistedFrontierRow(
+              tailMessages[i]!.role,
+              tailMessages[i]!.content,
+              storedBatch[i]!.role,
+              storedBatch[i]!.content,
+              { allowUntimestampedInboundBodyMatch: true },
+            )
+          ) {
             continue;
           }
           aligned = false;
