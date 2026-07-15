@@ -29,6 +29,20 @@ import { buildMessageIdentityHash } from "./store/message-identity.js";
 import type { LargeFileRecord, SummaryStore } from "./store/summary-store.js";
 import type { LcmDependencies } from "./types.js";
 
+/**
+ * Collapse only the whitespace OpenClaw core actually rewrites on the runtime
+ * face: runs of spaces squashed to a single space. Newlines, tabs, and
+ * leading/trailing whitespace are preserved, so two turns that differ in
+ * meaningful whitespace (line breaks or tab indentation) are never treated as
+ * one. Frontier-coverage comparison only; storage stays byte-verbatim.
+ */
+function normalizeFrontierWhitespace(content: string): string {
+  return content.replace(/ +/g, (spaces, offset: number) => {
+    const isMessageBoundary = offset === 0 || offset + spaces.length === content.length;
+    return isMessageBoundary ? spaces : " ";
+  });
+}
+
 export class BatchDeduplicator {
   constructor(
     private readonly conversationStore: ConversationStore,
@@ -75,13 +89,18 @@ export class BatchDeduplicator {
    * recognized timestamp decoration — user-role only. A genuinely distinct
    * turn, or one that merely quotes or authors metadata-shaped prose, is never
    * collapsed (silent data loss).
+   * A third case: faces identical apart from insignificant whitespace (core
+   * collapses the runtime indentation; the transcript persists it verbatim).
    */
   private runtimeRowCoversPersistedFrontierRow(
     persistedRole: string,
     persistedContent: string,
     batchRole: string,
     batchContent: string,
-    options?: { allowUntimestampedInboundBodyMatch?: boolean },
+    options?: {
+      allowCollapsedSpaceRunMatch?: boolean;
+      allowUntimestampedInboundBodyMatch?: boolean;
+    },
   ): boolean {
     if (
       messageIdentity(persistedRole, persistedContent) ===
@@ -91,6 +110,22 @@ export class BatchDeduplicator {
     }
     if (persistedRole !== "user" || batchRole !== "user") {
       return false;
+    }
+    // Whitespace-divergent faces of the same turn: core collapses the runtime
+    // message's space runs to single spaces while the transcript keeps them
+    // verbatim, so their identity_hashes differ and the decoration matcher's
+    // containment check breaks on the whitespace too. Treat them as one turn
+    // only when identical once those space runs are normalized. Newlines and
+    // tabs stay significant (comparison only; the verbatim persisted row
+    // survives).
+    if (options?.allowCollapsedSpaceRunMatch === true) {
+      const normalizedPersisted = normalizeFrontierWhitespace(persistedContent);
+      if (
+        normalizedPersisted.length > 0 &&
+        normalizedPersisted === normalizeFrontierWhitespace(batchContent)
+      ) {
+        return true;
+      }
     }
     // A metadata block alone is user-forgeable, so body equality after stripping
     // it is not proof of same-turn decoration. Covered-frontier callers may use
@@ -161,6 +196,7 @@ export class BatchDeduplicator {
               tailMessages[i]!.content,
               storedBatch[i]!.role,
               storedBatch[i]!.content,
+              { allowCollapsedSpaceRunMatch: true },
             )
           ) {
             exactAnchor = true;
